@@ -276,6 +276,14 @@ static int mcux_pwm_calc_ticks(uint16_t first_capture, uint16_t second_capture, 
 {
 	uint32_t ticks;
 
+	/* In capture-only mode VAL1 and INIT are both 0, giving mod=0.
+	 * The counter still runs its full 16-bit range (0x0000 to 0xFFFF),
+	 * so treat mod=0 as 0xFFFF to keep the wrap-around arithmetic correct.
+	 */
+	if (mod == 0) {
+		mod = 0xFFFFU;
+	}
+
 	if (second_capture >= first_capture) {
 		/* No timer overflow between captures */
 		ticks = second_capture - first_capture;
@@ -350,9 +358,10 @@ static void mcux_pwm_isr(const struct device *dev)
 	status = PWM_GetStatusFlags(config->base, config->index);
 	PWM_ClearStatusFlags(config->base, config->index, status);
 
-	if (status & kPWM_ReloadFlag) {
-		err = u32_add_overflow(capture->overflow_count, 1, &capture->overflow_count);
-	}
+	/* Reload interrupt is disabled in enable_capture — overflow counting
+	 * is not needed when VAL1=0xFFFF and the signal period fits within
+	 * the 16-bit counter range at the configured prescaler.
+	 */
 
 	if (capture->capture_channel == 0) {
 		/* Handle Channel A capture */
@@ -515,6 +524,15 @@ static int mcux_pwm_configure_capture(const struct device *dev,
 		config->input_filter_period);
 #endif
 
+	/* Set counter to run its full 16-bit range in capture-only mode.
+	 * Without a PWM output configured the driver never sets VAL1, leaving
+	 * it 0. modValue = VAL1 - INIT = 0 causes mcux_pwm_calc_ticks to
+	 * underflow on any counter wrap. Setting INIT=0 / VAL1=0xFFFF ensures
+	 * modValue=0xFFFF which is correct for a free-running 16-bit counter.
+	 */
+	config->base->SM[config->index].INIT = 0x0000;
+	config->base->SM[config->index].VAL1 = 0xFFFF;
+
 	return 0;
 }
 
@@ -546,28 +564,33 @@ static int mcux_pwm_enable_capture(const struct device *dev, uint32_t channel)
 	 */
 	status = PWM_GetStatusFlags(config->base, config->index);
 	PWM_ClearStatusFlags(config->base, config->index, status);
-	/* Enable interrupt and clear the capture FIFOs by reading them */
+	/* Enable capture interrupts and clear the capture FIFOs by reading them.
+	 * Note: kPWM_ReloadInterruptEnable is intentionally omitted — the reload
+	 * interrupt increments overflow_count, but with VAL1=0xFFFF the counter
+	 * period (65536 ticks) is always longer than any expected pulse or signal
+	 * period at the configured prescaler, so overflow counting is not needed
+	 * and only causes incorrect results.
+	 */
 	if (channel == 0U) {
 		(void)config->base->SM[config->index].CVAL2;
 		(void)config->base->SM[config->index].CVAL3;
-		PWM_EnableInterrupts(config->base, config->index, kPWM_CaptureA0InterruptEnable |
-			kPWM_CaptureA1InterruptEnable | kPWM_ReloadInterruptEnable);
+		PWM_EnableInterrupts(config->base, config->index,
+			kPWM_CaptureA0InterruptEnable | kPWM_CaptureA1InterruptEnable);
 	} else if (channel == 1U) {
 		(void)config->base->SM[config->index].CVAL4;
 		(void)config->base->SM[config->index].CVAL5;
-		PWM_EnableInterrupts(config->base, config->index, kPWM_CaptureB0InterruptEnable |
-			kPWM_CaptureB1InterruptEnable | kPWM_ReloadInterruptEnable);
+		PWM_EnableInterrupts(config->base, config->index,
+			kPWM_CaptureB0InterruptEnable | kPWM_CaptureB1InterruptEnable);
 	} else {
 		(void)config->base->SM[config->index].CVAL0;
 		(void)config->base->SM[config->index].CVAL1;
-		PWM_EnableInterrupts(config->base, config->index, kPWM_CaptureX0InterruptEnable |
-			kPWM_CaptureX1InterruptEnable | kPWM_ReloadInterruptEnable);
+		PWM_EnableInterrupts(config->base, config->index,
+			kPWM_CaptureX0InterruptEnable | kPWM_CaptureX1InterruptEnable);
 	}
 
-	/* Start the PWM counter if it's stopped.*/
-	if ((config->base->MCTRL & PWM_MCTRL_RUN_MASK) == 0) {
-		PWM_StartTimer(config->base, (1U << config->index));
-	}
+	/* Apply VAL1/INIT set in configure_capture via LDOK, then start counter */
+	config->base->MCTRL |= PWM_MCTRL_LDOK(1U << config->index);
+	PWM_StartTimer(config->base, (1U << config->index));
 
 	return 0;
 }
